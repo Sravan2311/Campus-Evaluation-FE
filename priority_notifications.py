@@ -1,355 +1,239 @@
-import argparse
-import datetime
 import heapq
+import datetime
 import json
+import urllib.error
 import urllib.request
-import urllib.parse
-import os
+from dataclasses import dataclass, field
+from typing import List, Optional
 
-# Try to import PIL for generating visualization
 try:
     from PIL import Image, ImageDraw, ImageFont
-    HAS_PIL = True
 except ImportError:
-    HAS_PIL = False
+    Image = None
+    ImageDraw = None
+    ImageFont = None
 
-def parse_ts(v):
-    if isinstance(v, datetime.datetime):
-        return v
-    for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d %H:%M:%S"):
-        try:
-            return datetime.datetime.strptime(v, fmt)
-        except Exception:
-            pass
+
+@dataclass(order=True)
+class PrioritizedNotification:
+    sort_index: float = field(init=False)
+    score: float = field(compare=False)
+    notification: dict = field(compare=False)
+
+    def __post_init__(self):
+        self.sort_index = self.score
+
+
+class PriorityInbox:
+    """Maintains the top N most important unread notifications."""
+
+    PLACEMENT_WEIGHT = {
+        "banner": 5.0,
+        "alert": 4.0,
+        "email": 3.0,
+        "message": 2.0,
+        "summary": 1.0,
+    }
+    RESULT_WEIGHT = {
+        "success": 4.0,
+        "warning": 3.0,
+        "info": 2.0,
+        "fail": 1.0,
+    }
+    EVENT_WEIGHT = {
+        "deadline": 5.0,
+        "emergency": 4.0,
+        "meeting": 3.0,
+        "reminder": 2.0,
+        "social": 1.0,
+    }
+
+    def __init__(self, capacity: int = 10):
+        self.capacity = capacity
+        self.heap: List[PrioritizedNotification] = []
+
+    def _normalize(self, value: float, min_value: float, max_value: float) -> float:
+        if max_value <= min_value:
+            return 0.0
+        return (value - min_value) / (max_value - min_value)
+
+    def _recency_score(self, timestamp: datetime.datetime, now: Optional[datetime.datetime] = None) -> float:
+        now = now or datetime.datetime.utcnow()
+        age_seconds = max(0.0, (now - timestamp).total_seconds())
+        age_hours = age_seconds / 3600.0
+        # More recent notifications get higher recency score; older notifications decay.
+        return 1.0 / (1.0 + age_hours)
+
+    def _importance_score(self, notification: dict, now: Optional[datetime.datetime] = None) -> float:
+        placement = notification.get("placement", "summary")
+        result = notification.get("result", "info")
+        event = notification.get("event", "social")
+        timestamp = notification.get("timestamp")
+
+        placement_score = self.PLACEMENT_WEIGHT.get(placement, 1.0)
+        result_score = self.RESULT_WEIGHT.get(result, 1.0)
+        event_score = self.EVENT_WEIGHT.get(event, 1.0)
+        recency_score = self._recency_score(timestamp, now)
+
+        return (
+            placement_score * 0.35
+            + result_score * 0.25
+            + event_score * 0.25
+            + recency_score * 1.5
+        )
+
+    def add_notification(self, notification: dict, now: Optional[datetime.datetime] = None) -> None:
+        if notification.get("read", False):
+            return
+
+        score = self._importance_score(notification, now)
+        entry = PrioritizedNotification(score=score, notification=notification)
+
+        if len(self.heap) < self.capacity:
+            heapq.heappush(self.heap, entry)
+        else:
+            if score > self.heap[0].score:
+                heapq.heapreplace(self.heap, entry)
+
+    def top_notifications(self) -> List[dict]:
+        return [item.notification for item in sorted(self.heap, key=lambda x: x.score, reverse=True)]
+
+    def snapshot(self) -> str:
+        rows = ["Top {} Priority Notifications:".format(self.capacity)]
+        for index, notification in enumerate(self.top_notifications(), 1):
+            rows.append(
+                f"{index}. [{notification['timestamp'].isoformat()}] {notification['title']}"
+                f" (placement={notification['placement']}, result={notification['result']}, event={notification['event']}, score={self._importance_score(notification):.3f})"
+            )
+        return "\n".join(rows)
+
+
+def build_sample_notifications() -> List[dict]:
+    now = datetime.datetime.utcnow()
+    sample_data = [
+        {"id": 1, "title": "Final exam schedule updated", "placement": "banner", "result": "info", "event": "deadline", "timestamp": now - datetime.timedelta(hours=1), "read": False},
+        {"id": 2, "title": "Fire drill tomorrow at 9 AM", "placement": "alert", "result": "warning", "event": "emergency", "timestamp": now - datetime.timedelta(hours=2), "read": False},
+        {"id": 3, "title": "New assignment posted for CS101", "placement": "email", "result": "info", "event": "deadline", "timestamp": now - datetime.timedelta(hours=4), "read": False},
+        {"id": 4, "title": "Sports fest registration deadline", "placement": "summary", "result": "warning", "event": "deadline", "timestamp": now - datetime.timedelta(days=1), "read": False},
+        {"id": 5, "title": "Guest lecture on AI starts in 30 minutes", "placement": "banner", "result": "info", "event": "meeting", "timestamp": now - datetime.timedelta(minutes=20), "read": False},
+        {"id": 6, "title": "Lab session canceled", "placement": "email", "result": "fail", "event": "meeting", "timestamp": now - datetime.timedelta(hours=5), "read": False},
+        {"id": 7, "title": "Your fee payment is due", "placement": "alert", "result": "warning", "event": "deadline", "timestamp": now - datetime.timedelta(hours=8), "read": False},
+        {"id": 8, "title": "Cafeteria menu updated", "placement": "summary", "result": "info", "event": "social", "timestamp": now - datetime.timedelta(hours=3), "read": False},
+        {"id": 9, "title": "Counseling session tomorrow", "placement": "message", "result": "info", "event": "meeting", "timestamp": now - datetime.timedelta(hours=12), "read": False},
+        {"id": 10, "title": "Hackathon team matching open", "placement": "email", "result": "info", "event": "social", "timestamp": now - datetime.timedelta(hours=10), "read": False},
+        {"id": 11, "title": "Network maintenance at midnight", "placement": "alert", "result": "warning", "event": "reminder", "timestamp": now - datetime.timedelta(hours=6), "read": False},
+        {"id": 12, "title": "Results published for last semester", "placement": "banner", "result": "success", "event": "info", "timestamp": now - datetime.timedelta(hours=15), "read": False},
+        {"id": 13, "title": "Library books due tomorrow", "placement": "email", "result": "warning", "event": "deadline", "timestamp": now - datetime.timedelta(hours=20), "read": False},
+        {"id": 14, "title": "Hostel water outage notice", "placement": "alert", "result": "warning", "event": "emergency", "timestamp": now - datetime.timedelta(hours=7), "read": False},
+        {"id": 15, "title": "Club meet tonight", "placement": "message", "result": "info", "event": "social", "timestamp": now - datetime.timedelta(hours=2, minutes=15), "read": False},
+        {"id": 16, "title": "Semester registration open", "placement": "banner", "result": "success", "event": "deadline", "timestamp": now - datetime.timedelta(days=2), "read": False},
+        {"id": 17, "title": "Guest Wi-Fi password changed", "placement": "summary", "result": "info", "event": "reminder", "timestamp": now - datetime.timedelta(minutes=30), "read": False},
+        {"id": 18, "title": "Lab safety training due", "placement": "email", "result": "warning", "event": "deadline", "timestamp": now - datetime.timedelta(hours=16), "read": False},
+        {"id": 19, "title": "Transit delay advisory", "placement": "message", "result": "warning", "event": "reminder", "timestamp": now - datetime.timedelta(hours=18), "read": False},
+        {"id": 20, "title": "End-of-year cultural event details", "placement": "summary", "result": "info", "event": "social", "timestamp": now - datetime.timedelta(hours=9), "read": False},
+    ]
+    return sample_data
+
+
+def _parse_timestamp(value):
+    if isinstance(value, datetime.datetime):
+        return value
+    if isinstance(value, str):
+        for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%SZ"):
+            try:
+                return datetime.datetime.strptime(value, fmt)
+            except ValueError:
+                continue
     return datetime.datetime.utcnow()
 
-def score(n, now=None):
-    now = now or datetime.datetime.utcnow()
-    p = {"banner": 5, "alert": 4, "email": 3, "message": 2, "summary": 1}.get(n.get("placement"), 1)
-    r = {"success": 4, "warning": 3, "info": 2, "fail": 1}.get(n.get("result"), 2)
-    e = {"deadline": 5, "emergency": 4, "meeting": 3, "reminder": 2, "social": 1}.get(n.get("event"), 1)
-    t = parse_ts(n.get("timestamp", ""))
-    age = max((now - t).total_seconds() / 3600, 0)
-    return p * 0.35 + r * 0.25 + e * 0.25 + 1.5 / (1 + age)
 
-def get_mock_notifications():
-    # Return a rich dataset of 25 mock notifications for demonstration/fallback
-    base_time = datetime.datetime.utcnow()
-    return [
-        {
-            "id": "mock-1",
-            "title": "EMERGENCY: Fire Drill in Block A",
-            "placement": "alert",
-            "result": "warning",
-            "event": "emergency",
-            "timestamp": (base_time - datetime.timedelta(minutes=5)).isoformat() + "Z",
-            "read": False,
-            "notification_type": "Event"
-        },
-        {
-            "id": "mock-2",
-            "title": "CRITICAL: Final Semester Registration Deadline",
-            "placement": "banner",
-            "result": "fail",
-            "event": "deadline",
-            "timestamp": (base_time - datetime.timedelta(minutes=15)).isoformat() + "Z",
-            "read": False,
-            "notification_type": "Event"
-        },
-        {
-            "id": "mock-3",
-            "title": "Placement Cell: Interview scheduled with Google",
-            "placement": "email",
-            "result": "success",
-            "event": "meeting",
-            "timestamp": (base_time - datetime.timedelta(hours=1)).isoformat() + "Z",
-            "read": False,
-            "notification_type": "Placement"
-        },
-        {
-            "id": "mock-4",
-            "title": "System Update: Campus Wi-Fi maintenance tonight",
-            "placement": "summary",
-            "result": "info",
-            "event": "reminder",
-            "timestamp": (base_time - datetime.timedelta(hours=3)).isoformat() + "Z",
-            "read": False,
-            "notification_type": "Result"
-        },
-        {
-            "id": "mock-5",
-            "title": "Urgent Message from HOD: Seminar attendance required",
-            "placement": "message",
-            "result": "warning",
-            "event": "emergency",
-            "timestamp": (base_time - datetime.timedelta(hours=2)).isoformat() + "Z",
-            "read": False,
-            "notification_type": "Event"
-        },
-        {
-            "id": "mock-6",
-            "title": "Library Book Due Date Tomorrow",
-            "placement": "message",
-            "result": "info",
-            "event": "reminder",
-            "timestamp": (base_time - datetime.timedelta(hours=6)).isoformat() + "Z",
-            "read": False,
-            "notification_type": "Event"
-        },
-        {
-            "id": "mock-7",
-            "title": "Sports Club: Annual Meet registrations open",
-            "placement": "summary",
-            "result": "success",
-            "event": "social",
-            "timestamp": (base_time - datetime.timedelta(hours=12)).isoformat() + "Z",
-            "read": False,
-            "notification_type": "Placement"
-        },
-        {
-            "id": "mock-8",
-            "title": "Midterm Results Published - Check Portal",
-            "placement": "banner",
-            "result": "success",
-            "event": "reminder",
-            "timestamp": (base_time - datetime.timedelta(hours=8)).isoformat() + "Z",
-            "read": False,
-            "notification_type": "Result"
-        },
-        {
-            "id": "mock-9",
-            "title": "Canteen: Special lunch menu today",
-            "placement": "summary",
-            "result": "info",
-            "event": "social",
-            "timestamp": (base_time - datetime.timedelta(minutes=45)).isoformat() + "Z",
-            "read": False,
-            "notification_type": "Event"
-        },
-        {
-            "id": "mock-10",
-            "title": "Payment Gateway Error: Hostel fee receipt failed",
-            "placement": "alert",
-            "result": "fail",
-            "event": "deadline",
-            "timestamp": (base_time - datetime.timedelta(hours=4)).isoformat() + "Z",
-            "read": False,
-            "notification_type": "Result"
-        },
-        {
-            "id": "mock-11",
-            "title": "Club Meet: Coding Club Hackathon brainstorming",
-            "placement": "message",
-            "result": "info",
-            "event": "meeting",
-            "timestamp": (base_time - datetime.timedelta(hours=10)).isoformat() + "Z",
-            "read": False,
-            "notification_type": "Event"
-        },
-        {
-            "id": "mock-12",
-            "title": "New Assignment uploaded in DBMS course",
-            "placement": "email",
-            "result": "info",
-            "event": "reminder",
-            "timestamp": (base_time - datetime.timedelta(hours=24)).isoformat() + "Z",
-            "read": False,
-            "notification_type": "Event"
-        }
-    ]
+def fetch_notifications_from_api(url: str) -> List[dict]:
+    request = urllib.request.Request(url, headers={"Accept": "application/json"})
+    with urllib.request.urlopen(request, timeout=10) as response:
+        body = response.read().decode("utf-8")
+        payload = json.loads(body)
 
-def fetch(url, limit=None, page=None, notification_type=None):
-    query = {}
-    if limit is not None:
-        query["limit"] = str(limit)
-    if page is not None:
-        query["page"] = str(page)
-    if notification_type:
-        query["notification_type"] = notification_type
-    parsed = list(urllib.parse.urlparse(url))
-    parsed[4] = urllib.parse.urlencode(query)
-    url_with_query = urllib.parse.urlunparse(parsed)
+    if isinstance(payload, dict) and "notifications" in payload:
+        notifications = payload["notifications"]
+    elif isinstance(payload, list):
+        notifications = payload
+    else:
+        raise ValueError("Unexpected API payload format")
 
-    # Note: If unauthorized, we catch it and raise, falling back to mock data
-    req = urllib.request.Request(url_with_query, headers={"Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=10) as r:
-        data = json.loads(r.read().decode())
-    if isinstance(data, dict) and "notifications" in data:
-        data = data["notifications"]
-    return [dict(n, timestamp=parse_ts(n.get("timestamp", ""))) for n in data if isinstance(n, dict)]
-
-def top_n(items, n=10):
-    heap = []
-    for item in items:
-        if item.get("read"):
+    parsed: List[dict] = []
+    for notification in notifications:
+        if not isinstance(notification, dict):
             continue
-        s = score(item)
-        if len(heap) < n:
-            heapq.heappush(heap, (s, item))
-        elif s > heap[0][0]:
-            heapq.heapreplace(heap, (s, item))
-    return [item for _, item in sorted(heap, key=lambda x: x[0], reverse=True)]
+        notification = notification.copy()
+        if "timestamp" in notification:
+            notification["timestamp"] = _parse_timestamp(notification["timestamp"])
+        else:
+            notification["timestamp"] = datetime.datetime.utcnow()
+        parsed.append(notification)
 
-def draw_notifications_image(items, output_path):
-    if not HAS_PIL:
-        print("PIL/Pillow is not installed. Skipping image generation.")
-        return False
-    
+    return parsed
+
+
+def render_screenshot(text: str, path: str = "priority_notifications_output.png") -> None:
+    if Image is None or ImageDraw is None or ImageFont is None:
+        return
+
+    lines = text.splitlines()
     width = 900
-    header_height = 80
-    card_height = 100
-    spacing = 15
-    height = header_height + len(items) * (card_height + spacing) + 40
-    
-    # Create image
-    img = Image.new("RGB", (width, height), color="#0f172a") # Dark Slate background
-    draw = ImageDraw.Draw(img)
-    
-    # Load fonts
-    try:
-        title_font = ImageFont.truetype("arial.ttf", 26)
-        subtitle_font = ImageFont.truetype("arial.ttf", 14)
-        card_title_font = ImageFont.truetype("arial.ttf", 16)
-        card_text_font = ImageFont.truetype("arial.ttf", 12)
-        score_font = ImageFont.truetype("arial.ttf", 18)
-    except IOError:
-        # Fallback to default font
-        title_font = subtitle_font = card_title_font = card_text_font = score_font = ImageFont.load_default()
-        
-    # Draw Header
-    draw.text((30, 20), "Priority Notifications Inbox", fill="#f8fafc", font=title_font)
-    draw.text((30, 52), f"Top {len(items)} Unread Notifications - Ranked by Recency and Severity Score", fill="#94a3b8", font=subtitle_font)
-    
-    # Draw divider line
-    draw.line((30, 75, width - 30, 75), fill="#334155", width=2)
-    
-    y_offset = header_height + 20
-    
-    # Draw cards
-    for idx, item in enumerate(items, start=1):
-        s = score(item)
-        
-        # Color mapping based on event/result
-        badge_color = "#3b82f6" # Default blue
-        event = item.get("event", "")
-        result = item.get("result", "")
-        
-        if event == "emergency" or event == "deadline":
-            badge_color = "#ef4444" # Red
-        elif result == "warning":
-            badge_color = "#f59e0b" # Amber
-        elif result == "success":
-            badge_color = "#10b981" # Emerald
-        elif event == "social":
-            badge_color = "#8b5cf6" # Violet
-            
-        # Draw Card Background
-        card_left = 30
-        card_top = y_offset
-        card_right = width - 30
-        card_bottom = y_offset + card_height
-        
-        # Draw card rounded rect
-        draw.rounded_rectangle((card_left, card_top, card_right, card_bottom), radius=8, fill="#1e293b", outline="#334155", width=1)
-        
-        # Draw Left Severity Stripe
-        draw.rounded_rectangle((card_left, card_top, card_left + 8, card_bottom), radius=8, fill=badge_color)
-        # Rect cover to make the right edge of stripe flat
-        draw.rectangle((card_left + 4, card_top, card_left + 8, card_bottom), fill=badge_color)
-        
-        # Text details
-        title = f"{idx}. {item.get('title', '<No Title>')}"
-        if len(title) > 60:
-            title = title[:57] + "..."
-            
-        time_str = parse_ts(item.get("timestamp")).strftime("%Y-%m-%d %H:%M:%S UTC")
-        meta_str = f"Placement: {item.get('placement')}   |   Event: {item.get('event')}   |   Result: {item.get('result')}"
-        
-        draw.text((card_left + 25, card_top + 15), title, fill="#f8fafc", font=card_title_font)
-        draw.text((card_left + 25, card_top + 45), meta_str, fill="#94a3b8", font=card_text_font)
-        draw.text((card_left + 25, card_top + 68), f"Time: {time_str}", fill="#64748b", font=card_text_font)
-        
-        # Draw score circle/badge on the right
-        score_bg_left = card_right - 120
-        score_bg_top = card_top + 25
-        score_bg_right = card_right - 25
-        score_bg_bottom = card_bottom - 25
-        
-        draw.rounded_rectangle((score_bg_left, score_bg_top, score_bg_right, score_bg_bottom), radius=6, fill="#0f172a", outline="#334155", width=1)
-        score_txt = f"Score: {s:.2f}"
-        
-        # Draw score text centered in badge
-        draw.text((score_bg_left + 12, score_bg_top + 13), score_txt, fill="#38bdf8", font=score_font)
-        
-        y_offset += card_height + spacing
-        
-    # Save Image
-    img.save(output_path)
-    print(f"Generated priority visualization image at {output_path}")
-    return True
+    margin = 20
+    line_height = 28
+    height = margin * 2 + line_height * len(lines)
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--api-url",
-        default="http://4.224.186.213/evaluation-service/notifications",
-        help="Notification API URL (default uses the provided endpoint)",
-    )
-    parser.add_argument("--n", type=int, default=10, help="Number of top notifications")
-    parser.add_argument("--limit", type=int, default=50, help="API limit query parameter")
-    parser.add_argument("--page", type=int, default=1, help="API page query parameter")
-    parser.add_argument("--notification-type", default=None, help="API notification_type query parameter")
-    args = parser.parse_args()
-    
-    notifications = []
-    fetched_successfully = False
-    
+    image = Image.new("RGB", (width, height), color=(255, 255, 255))
+    draw = ImageDraw.Draw(image)
+
     try:
-        print(f"Fetching notifications from {args.api_url}...")
-        notifications = fetch(
-            args.api_url,
-            limit=args.limit,
-            page=args.page,
-            notification_type=args.notification_type,
-        )
-        fetched_successfully = True
-        print(f"Successfully fetched {len(notifications)} notifications from the API.")
-    except Exception as e:
-        print(f"Fetch error: {e}")
-        print("Falling back to mock campus notification dataset...")
-        notifications = get_mock_notifications()
-        # Parse timestamps in mock data
-        for n in notifications:
-            n["timestamp"] = parse_ts(n.get("timestamp"))
-            
-    # Calculate top notifications
-    top_list = top_n(notifications, args.n)
-    
-    # Print to console
-    print("\n================ TOP NOTIFICATIONS ================")
-    for idx, item in enumerate(top_list, start=1):
-        s = score(item)
-        print(f"{idx}. {item.get('title','<no title>')} [Score: {s:.2f}] ({item.get('placement')},{item.get('result')},{item.get('event')})")
-    print("===================================================\n")
-    
-    # Write top_notifications.json
-    # Convert timestamps back to ISO strings for JSON serialization
-    json_list = []
-    for item in top_list:
-        n_copy = item.copy()
-        if isinstance(n_copy["timestamp"], datetime.datetime):
-            n_copy["timestamp"] = n_copy["timestamp"].isoformat() + "Z"
-        n_copy["score"] = score(item)
-        json_list.append(n_copy)
-        
-    json_path = "top_notifications.json"
-    with open(json_path, "w") as f:
-        json.dump(json_list, f, indent=2)
-    print(f"Saved ranked notifications to {json_path}")
-    
-    # Generate visualization
-    image_path = "priority_notifications_output.png"
-    draw_notifications_image(top_list, image_path)
+        font = ImageFont.truetype("arial.ttf", 16)
+    except Exception:
+        font = ImageFont.load_default()
+
+    y = margin
+    for line in lines:
+        draw.text((margin, y), line, fill=(30, 30, 30), font=font)
+        y += line_height
+
+    image.save(path)
+
+
+def main() -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Priority Inbox for unread notifications")
+    parser.add_argument("--api-url", help="Notification API URL to fetch notifications from", default=None)
+    parser.add_argument("--capacity", help="Number of top notifications to keep", type=int, default=10)
+    args = parser.parse_args()
+
+    inbox = PriorityInbox(capacity=args.capacity)
+
+    if args.api_url:
+        try:
+            notifications = fetch_notifications_from_api(args.api_url)
+        except (urllib.error.URLError, urllib.error.HTTPError, ValueError, json.JSONDecodeError) as error:
+            print(f"Failed to fetch notifications from API: {error}")
+            return
+    else:
+        notifications = build_sample_notifications()
+
+    for notification in notifications:
+        inbox.add_notification(notification)
+
+    output = inbox.snapshot()
+    print(output)
+
+    if Image is not None:
+        render_screenshot(output)
+        print("Screenshot saved to priority_notifications_output.png")
+    else:
+        print("Pillow not installed; screenshot generation skipped.")
+
+    with open("top_notifications.json", "w", encoding="utf-8") as file:
+        json.dump(inbox.top_notifications(), file, default=str, indent=2)
+
 
 if __name__ == "__main__":
     main()
