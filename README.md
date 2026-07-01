@@ -1,4 +1,4 @@
-# Campus Evaluation Notification System (FE Backend Logic)
+# Campus Evaluation Notification System 
 
 A priority-based notification inbox system that dynamically ranks campus notifications by importance and recency. This project implements an efficient ranking algorithm using a Min-Heap (`O(log n)` insertion complexity) to maintain the top `N` most relevant notifications for users.
 
